@@ -4,12 +4,16 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
 	"time"
 
+	tmjson "github.com/tendermint/tendermint/libs/json"
 	"github.com/tendermint/tendermint/libs/log"
+	tmos "github.com/tendermint/tendermint/libs/os"
+	"github.com/tendermint/tendermint/types"
 )
 
 const (
@@ -125,32 +129,8 @@ func (cfg *Config) SetRoot(root string) *Config {
 	cfg.P2P.RootDir = root
 	cfg.Mempool.RootDir = root
 	cfg.Consensus.RootDir = root
+	cfg.PrivValidator.RootDir = root
 	return cfg
-}
-
-// PrivValidatorClientKeyFile returns the full path to the priv_validator_key.json file
-func (cfg Config) PrivValidatorClientKeyFile() string {
-	return rootify(cfg.PrivValidator.ClientKey, cfg.RootDir)
-}
-
-// PrivValidatorClientCertificateFile returns the full path to the priv_validator_key.json file
-func (cfg Config) PrivValidatorClientCertificateFile() string {
-	return rootify(cfg.PrivValidator.ClientCertificate, cfg.RootDir)
-}
-
-// PrivValidatorCertificateAuthorityFile returns the full path to the priv_validator_key.json file
-func (cfg Config) PrivValidatorRootCAFile() string {
-	return rootify(cfg.PrivValidator.RootCA, cfg.RootDir)
-}
-
-// PrivValidatorKeyFile returns the full path to the priv_validator_key.json file
-func (cfg Config) PrivValidatorKeyFile() string {
-	return rootify(cfg.PrivValidator.Key, cfg.RootDir)
-}
-
-// PrivValidatorFile returns the full path to the priv_validator_state.json file
-func (cfg Config) PrivValidatorStateFile() string {
-	return rootify(cfg.PrivValidator.State, cfg.RootDir)
 }
 
 // ValidateBasic performs basic validation (checking param bounds, etc.) and
@@ -306,22 +286,44 @@ func (cfg BaseConfig) NodeKeyFile() string {
 	return rootify(cfg.NodeKey, cfg.RootDir)
 }
 
+// LoadNodeKey loads NodeKey located in filePath.
+func (cfg BaseConfig) LoadNodeKeyID() (types.NodeID, error) {
+	jsonBytes, err := ioutil.ReadFile(cfg.NodeKeyFile())
+	if err != nil {
+		return "", err
+	}
+	nodeKey := types.NodeKey{}
+	err = tmjson.Unmarshal(jsonBytes, &nodeKey)
+	if err != nil {
+		return "", err
+	}
+	nodeKey.ID = types.NodeIDFromPubKey(nodeKey.PubKey())
+	return nodeKey.ID, nil
+}
+
+// LoadOrGenNodeKey attempts to load the NodeKey from the given filePath. If
+// the file does not exist, it generates and saves a new NodeKey.
+func (cfg BaseConfig) LoadOrGenNodeKeyID() (types.NodeID, error) {
+	if tmos.FileExists(cfg.NodeKeyFile()) {
+		nodeKey, err := cfg.LoadNodeKeyID()
+		if err != nil {
+			return "", err
+		}
+		return nodeKey, nil
+	}
+
+	nodeKey := types.GenNodeKey()
+
+	if err := nodeKey.SaveAs(cfg.NodeKeyFile()); err != nil {
+		return "", err
+	}
+
+	return nodeKey.ID, nil
+}
+
 // DBDir returns the full path to the database directory
 func (cfg BaseConfig) DBDir() string {
 	return rootify(cfg.DBPath, cfg.RootDir)
-}
-
-func (cfg Config) ArePrivValidatorClientSecurityOptionsPresent() bool {
-	switch {
-	case cfg.PrivValidator.RootCA == "":
-		return false
-	case cfg.PrivValidator.ClientKey == "":
-		return false
-	case cfg.PrivValidator.ClientCertificate == "":
-		return false
-	default:
-		return true
-	}
 }
 
 // ValidateBasic performs basic validation (checking param bounds, etc.) and
@@ -350,6 +352,8 @@ func (cfg BaseConfig) ValidateBasic() error {
 
 // PrivValidatorConfig defines the configuration parameters for running a validator
 type PrivValidatorConfig struct {
+	RootDir string `mapstructure:"home"`
+
 	// Path to the JSON file containing the private key to use as a validator in the consensus protocol
 	Key string `mapstructure:"key-file"`
 
@@ -377,6 +381,44 @@ func DefaultPrivValidatorConfig() *PrivValidatorConfig {
 	return &PrivValidatorConfig{
 		Key:   defaultPrivValKeyPath,
 		State: defaultPrivValStatePath,
+	}
+}
+
+// ClientKeyFile returns the full path to the priv_validator_key.json file
+func (cfg *PrivValidatorConfig) ClientKeyFile() string {
+	return rootify(cfg.ClientKey, cfg.RootDir)
+}
+
+// ClientCertificateFile returns the full path to the priv_validator_key.json file
+func (cfg *PrivValidatorConfig) ClientCertificateFile() string {
+	return rootify(cfg.ClientCertificate, cfg.RootDir)
+}
+
+// CertificateAuthorityFile returns the full path to the priv_validator_key.json file
+func (cfg *PrivValidatorConfig) RootCAFile() string {
+	return rootify(cfg.RootCA, cfg.RootDir)
+}
+
+// KeyFile returns the full path to the priv_validator_key.json file
+func (cfg *PrivValidatorConfig) KeyFile() string {
+	return rootify(cfg.Key, cfg.RootDir)
+}
+
+// StateFile returns the full path to the priv_validator_state.json file
+func (cfg *PrivValidatorConfig) StateFile() string {
+	return rootify(cfg.State, cfg.RootDir)
+}
+
+func (cfg *PrivValidatorConfig) AreSecurityOptionsPresent() bool {
+	switch {
+	case cfg.RootCA == "":
+		return false
+	case cfg.ClientKey == "":
+		return false
+	case cfg.ClientCertificate == "":
+		return false
+	default:
+		return true
 	}
 }
 
@@ -814,7 +856,7 @@ type StateSyncConfig struct {
 	TrustHash           string        `mapstructure:"trust-hash"`
 	DiscoveryTime       time.Duration `mapstructure:"discovery-time"`
 	ChunkRequestTimeout time.Duration `mapstructure:"chunk-request-timeout"`
-	ChunkFetchers       int32         `mapstructure:"chunk-fetchers"`
+	Fetchers            int32         `mapstructure:"fetchers"`
 }
 
 func (cfg *StateSyncConfig) TrustHashBytes() []byte {
@@ -831,8 +873,8 @@ func DefaultStateSyncConfig() *StateSyncConfig {
 	return &StateSyncConfig{
 		TrustPeriod:         168 * time.Hour,
 		DiscoveryTime:       15 * time.Second,
-		ChunkRequestTimeout: 10 * time.Second,
-		ChunkFetchers:       4,
+		ChunkRequestTimeout: 15 * time.Second,
+		Fetchers:            4,
 	}
 }
 
@@ -879,12 +921,12 @@ func (cfg *StateSyncConfig) ValidateBasic() error {
 			return fmt.Errorf("invalid trusted-hash: %w", err)
 		}
 
-		if cfg.ChunkRequestTimeout < time.Second {
-			return errors.New("chunk-request-timeout must be least a one second")
+		if cfg.ChunkRequestTimeout < 5*time.Second {
+			return errors.New("chunk-request-timeout must be at least 5 seconds")
 		}
 
-		if cfg.ChunkFetchers <= 0 {
-			return errors.New("chunk-fetchers is required")
+		if cfg.Fetchers <= 0 {
+			return errors.New("fetchers is required")
 		}
 	}
 

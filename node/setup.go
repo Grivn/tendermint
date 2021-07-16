@@ -81,13 +81,14 @@ func createAndStartIndexerService(
 
 	eventSinks := []indexer.EventSink{}
 
-	// Check duplicated sinks.
+	// check for duplicated sinks
 	sinks := map[string]bool{}
 	for _, s := range config.TxIndex.Indexer {
 		sl := strings.ToLower(s)
 		if sinks[sl] {
 			return nil, nil, errors.New("found duplicated sinks, please check the tx-index section in the config.toml")
 		}
+
 		sinks[sl] = true
 	}
 
@@ -95,25 +96,31 @@ loop:
 	for k := range sinks {
 		switch k {
 		case string(indexer.NULL):
-			// when we see null in the config, the eventsinks will be reset with the nullEventSink.
+			// When we see null in the config, the eventsinks will be reset with the
+			// nullEventSink.
 			eventSinks = []indexer.EventSink{null.NewEventSink()}
 			break loop
+
 		case string(indexer.KV):
 			store, err := dbProvider(&cfg.DBContext{ID: "tx_index", Config: config})
 			if err != nil {
 				return nil, nil, err
 			}
+
 			eventSinks = append(eventSinks, kv.NewEventSink(store))
+
 		case string(indexer.PSQL):
 			conn := config.TxIndex.PsqlConn
 			if conn == "" {
 				return nil, nil, errors.New("the psql connection settings cannot be empty")
 			}
+
 			es, _, err := psql.NewEventSink(conn, chainID)
 			if err != nil {
 				return nil, nil, err
 			}
 			eventSinks = append(eventSinks, es)
+
 		default:
 			return nil, nil, errors.New("unsupported event sink type")
 		}
@@ -331,6 +338,7 @@ func createBlockchainReactor(
 	peerManager *p2p.PeerManager,
 	router *p2p.Router,
 	fastSync bool,
+	metrics *cs.Metrics,
 ) (*p2p.ReactorShim, service.Service, error) {
 
 	logger = logger.With("module", "blockchain")
@@ -355,6 +363,7 @@ func createBlockchainReactor(
 		reactor, err := bcv0.NewReactor(
 			logger, state.Copy(), blockExec, blockStore, csReactor,
 			channels[bcv0.BlockchainChannel], peerUpdates, fastSync,
+			metrics,
 		)
 		if err != nil {
 			return nil, nil, err
@@ -363,7 +372,7 @@ func createBlockchainReactor(
 		return reactorShim, reactor, nil
 
 	case cfg.BlockchainV2:
-		reactor := bcv2.NewBlockchainReactor(state.Copy(), blockExec, blockStore, fastSync)
+		reactor := bcv2.NewBlockchainReactor(state.Copy(), blockExec, blockStore, fastSync, metrics)
 		reactor.SetLogger(logger)
 
 		return nil, reactor, nil
@@ -452,7 +461,7 @@ func createPeerManager(
 	config *cfg.Config,
 	dbProvider cfg.DBProvider,
 	p2pLogger log.Logger,
-	nodeID p2p.NodeID,
+	nodeID types.NodeID,
 ) (*p2p.PeerManager, error) {
 
 	var maxConns uint16
@@ -478,9 +487,9 @@ func createPeerManager(
 		maxConns = 64
 	}
 
-	privatePeerIDs := make(map[p2p.NodeID]struct{})
+	privatePeerIDs := make(map[types.NodeID]struct{})
 	for _, id := range tmstrings.SplitAndTrimEmpty(config.P2P.PrivatePeerIDs, ",", " ") {
-		privatePeerIDs[p2p.NodeID(id)] = struct{}{}
+		privatePeerIDs[types.NodeID(id)] = struct{}{}
 	}
 
 	options := p2p.PeerManagerOptions{
@@ -535,7 +544,7 @@ func createPeerManager(
 func createRouter(
 	p2pLogger log.Logger,
 	p2pMetrics *p2p.Metrics,
-	nodeInfo p2p.NodeInfo,
+	nodeInfo types.NodeInfo,
 	privKey crypto.PrivKey,
 	peerManager *p2p.PeerManager,
 	transport p2p.Transport,
@@ -563,8 +572,8 @@ func createSwitch(
 	consensusReactor *p2p.ReactorShim,
 	evidenceReactor *p2p.ReactorShim,
 	proxyApp proxy.AppConns,
-	nodeInfo p2p.NodeInfo,
-	nodeKey p2p.NodeKey,
+	nodeInfo types.NodeInfo,
+	nodeKey types.NodeKey,
 	p2pLogger log.Logger,
 ) *p2p.Switch {
 
@@ -642,21 +651,21 @@ func createSwitch(
 }
 
 func createAddrBookAndSetOnSwitch(config *cfg.Config, sw *p2p.Switch,
-	p2pLogger log.Logger, nodeKey p2p.NodeKey) (pex.AddrBook, error) {
+	p2pLogger log.Logger, nodeKey types.NodeKey) (pex.AddrBook, error) {
 
 	addrBook := pex.NewAddrBook(config.P2P.AddrBookFile(), config.P2P.AddrBookStrict)
 	addrBook.SetLogger(p2pLogger.With("book", config.P2P.AddrBookFile()))
 
 	// Add ourselves to addrbook to prevent dialing ourselves
 	if config.P2P.ExternalAddress != "" {
-		addr, err := p2p.NewNetAddressString(p2p.IDAddressString(nodeKey.ID, config.P2P.ExternalAddress))
+		addr, err := types.NewNetAddressString(nodeKey.ID.AddressString(config.P2P.ExternalAddress))
 		if err != nil {
 			return nil, fmt.Errorf("p2p.external_address is incorrect: %w", err)
 		}
 		addrBook.AddOurAddress(addr)
 	}
 	if config.P2P.ListenAddress != "" {
-		addr, err := p2p.NewNetAddressString(p2p.IDAddressString(nodeKey.ID, config.P2P.ListenAddress))
+		addr, err := types.NewNetAddressString(nodeKey.ID.AddressString(config.P2P.ListenAddress))
 		if err != nil {
 			return nil, fmt.Errorf("p2p.laddr is incorrect: %w", err)
 		}
@@ -696,7 +705,7 @@ func createPEXReactorV2(
 	router *p2p.Router,
 ) (*pex.ReactorV2, error) {
 
-	channel, err := router.OpenChannel(pex.ChannelDescriptor(), &protop2p.PexMessage{}, 4096)
+	channel, err := router.OpenChannel(pex.ChannelDescriptor(), &protop2p.PexMessage{}, 128)
 	if err != nil {
 		return nil, err
 	}
@@ -707,11 +716,11 @@ func createPEXReactorV2(
 
 func makeNodeInfo(
 	config *cfg.Config,
-	nodeKey p2p.NodeKey,
+	nodeKey types.NodeKey,
 	eventSinks []indexer.EventSink,
 	genDoc *types.GenesisDoc,
 	state sm.State,
-) (p2p.NodeInfo, error) {
+) (types.NodeInfo, error) {
 	txIndexerStatus := "off"
 
 	if indexer.IndexingEnabled(eventSinks) {
@@ -727,15 +736,15 @@ func makeNodeInfo(
 		bcChannel = bcv2.BlockchainChannel
 
 	default:
-		return p2p.NodeInfo{}, fmt.Errorf("unknown fastsync version %s", config.FastSync.Version)
+		return types.NodeInfo{}, fmt.Errorf("unknown fastsync version %s", config.FastSync.Version)
 	}
 
-	nodeInfo := p2p.NodeInfo{
-		ProtocolVersion: p2p.NewProtocolVersion(
-			version.P2PProtocol, // global
-			state.Version.Consensus.Block,
-			state.Version.Consensus.App,
-		),
+	nodeInfo := types.NodeInfo{
+		ProtocolVersion: types.ProtocolVersion{
+			P2P:   version.P2PProtocol, // global
+			Block: state.Version.Consensus.Block,
+			App:   state.Version.Consensus.App,
+		},
 		NodeID:  nodeKey.ID,
 		Network: genDoc.ChainID,
 		Version: version.TMVersion,
@@ -752,7 +761,7 @@ func makeNodeInfo(
 			byte(statesync.LightBlockChannel),
 		},
 		Moniker: config.Moniker,
-		Other: p2p.NodeInfoOther{
+		Other: types.NodeInfoOther{
 			TxIndex:    txIndexerStatus,
 			RPCAddress: config.RPC.ListenAddress,
 		},
@@ -776,22 +785,22 @@ func makeNodeInfo(
 
 func makeSeedNodeInfo(
 	config *cfg.Config,
-	nodeKey p2p.NodeKey,
+	nodeKey types.NodeKey,
 	genDoc *types.GenesisDoc,
 	state sm.State,
-) (p2p.NodeInfo, error) {
-	nodeInfo := p2p.NodeInfo{
-		ProtocolVersion: p2p.NewProtocolVersion(
-			version.P2PProtocol, // global
-			state.Version.Consensus.Block,
-			state.Version.Consensus.App,
-		),
+) (types.NodeInfo, error) {
+	nodeInfo := types.NodeInfo{
+		ProtocolVersion: types.ProtocolVersion{
+			P2P:   version.P2PProtocol, // global
+			Block: state.Version.Consensus.Block,
+			App:   state.Version.Consensus.App,
+		},
 		NodeID:   nodeKey.ID,
 		Network:  genDoc.ChainID,
 		Version:  version.TMVersion,
 		Channels: []byte{},
 		Moniker:  config.Moniker,
-		Other: p2p.NodeInfoOther{
+		Other: types.NodeInfoOther{
 			TxIndex:    "off",
 			RPCAddress: config.RPC.ListenAddress,
 		},

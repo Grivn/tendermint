@@ -19,7 +19,6 @@ import (
 	dbm "github.com/tendermint/tm-db"
 
 	abcicli "github.com/tendermint/tendermint/abci/client"
-	"github.com/tendermint/tendermint/abci/example/counter"
 	"github.com/tendermint/tendermint/abci/example/kvstore"
 	abci "github.com/tendermint/tendermint/abci/types"
 	cfg "github.com/tendermint/tendermint/config"
@@ -31,12 +30,12 @@ import (
 	"github.com/tendermint/tendermint/libs/log"
 	tmos "github.com/tendermint/tendermint/libs/os"
 	tmpubsub "github.com/tendermint/tendermint/libs/pubsub"
+	tmtime "github.com/tendermint/tendermint/libs/time"
 	"github.com/tendermint/tendermint/privval"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 	sm "github.com/tendermint/tendermint/state"
 	"github.com/tendermint/tendermint/store"
 	"github.com/tendermint/tendermint/types"
-	tmtime "github.com/tendermint/tendermint/types/time"
 )
 
 const (
@@ -432,9 +431,9 @@ func newStateWithConfigAndBlockStore(
 }
 
 func loadPrivValidator(config *cfg.Config) *privval.FilePV {
-	privValidatorKeyFile := config.PrivValidatorKeyFile()
+	privValidatorKeyFile := config.PrivValidator.KeyFile()
 	ensureDir(filepath.Dir(privValidatorKeyFile), 0700)
-	privValidatorStateFile := config.PrivValidatorStateFile()
+	privValidatorStateFile := config.PrivValidator.StateFile()
 	privValidator, err := privval.LoadOrGenFilePV(privValidatorKeyFile, privValidatorStateFile)
 	if err != nil {
 		panic(err)
@@ -449,7 +448,7 @@ func randState(config *cfg.Config, nValidators int) (*State, []*validatorStub) {
 
 	vss := make([]*validatorStub, nValidators)
 
-	cs := newState(state, privVals[0], counter.NewApplication(true))
+	cs := newState(state, privVals[0], kvstore.NewApplication())
 
 	for i := 0; i < nValidators; i++ {
 		vss[i] = newValidatorStub(privVals[i], int32(i))
@@ -862,16 +861,16 @@ func (m *mockTicker) Chan() <-chan timeoutInfo {
 
 func (*mockTicker) SetLogger(log.Logger) {}
 
-func newCounter() abci.Application {
-	return counter.NewApplication(true)
-}
-
 func newPersistentKVStore() abci.Application {
 	dir, err := ioutil.TempDir("", "persistent-kvstore")
 	if err != nil {
 		panic(err)
 	}
 	return kvstore.NewPersistentKVStoreApplication(dir)
+}
+
+func newKVStore() abci.Application {
+	return kvstore.NewApplication()
 }
 
 func newPersistentKVStoreWithPath(dbDir string) abci.Application {

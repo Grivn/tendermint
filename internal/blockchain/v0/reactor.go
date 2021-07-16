@@ -2,13 +2,16 @@ package v0
 
 import (
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	bc "github.com/tendermint/tendermint/internal/blockchain"
+	cons "github.com/tendermint/tendermint/internal/consensus"
 	"github.com/tendermint/tendermint/internal/p2p"
 	"github.com/tendermint/tendermint/libs/log"
 	"github.com/tendermint/tendermint/libs/service"
+	tmSync "github.com/tendermint/tendermint/libs/sync"
 	bcproto "github.com/tendermint/tendermint/proto/tendermint/blockchain"
 	sm "github.com/tendermint/tendermint/state"
 	"github.com/tendermint/tendermint/store"
@@ -32,10 +35,9 @@ var (
 				ID:                  byte(BlockchainChannel),
 				Priority:            5,
 				SendQueueCapacity:   1000,
-				RecvBufferCapacity:  50 * 4096,
+				RecvBufferCapacity:  1024,
 				RecvMessageCapacity: bc.MaxMsgSize,
-
-				MaxSendBytes: 100,
+				MaxSendBytes:        100,
 			},
 		},
 	}
@@ -65,14 +67,14 @@ type consensusReactor interface {
 
 type peerError struct {
 	err    error
-	peerID p2p.NodeID
+	peerID types.NodeID
 }
 
 func (e peerError) Error() string {
 	return fmt.Sprintf("error with peer %v: %s", e.peerID, e.err.Error())
 }
 
-// BlockchainReactor handles long-term catchup syncing.
+// Reactor handles long-term catchup syncing.
 type Reactor struct {
 	service.BaseService
 
@@ -83,12 +85,19 @@ type Reactor struct {
 	store       *store.BlockStore
 	pool        *BlockPool
 	consReactor consensusReactor
-	fastSync    bool
+	fastSync    *tmSync.AtomicBool
 
-	blockchainCh  *p2p.Channel
-	peerUpdates   *p2p.PeerUpdates
-	peerUpdatesCh chan p2p.Envelope
-	closeCh       chan struct{}
+	blockchainCh *p2p.Channel
+	// blockchainOutBridgeCh defines a channel that acts as a bridge between sending Envelope
+	// messages that the reactor will consume in processBlockchainCh and receiving messages
+	// from the peer updates channel and other goroutines. We do this instead of directly
+	// sending on blockchainCh.Out to avoid race conditions in the case where other goroutines
+	// send Envelopes directly to the to blockchainCh.Out channel, since processBlockchainCh
+	// may close the blockchainCh.Out channel at the same time that other goroutines send to
+	// blockchainCh.Out.
+	blockchainOutBridgeCh chan p2p.Envelope
+	peerUpdates           *p2p.PeerUpdates
+	closeCh               chan struct{}
 
 	requestsCh <-chan BlockRequest
 	errorsCh   <-chan peerError
@@ -97,6 +106,10 @@ type Reactor struct {
 	// requestRoutine spawned goroutines when stopping the reactor and before
 	// stopping the p2p Channel(s).
 	poolWG sync.WaitGroup
+
+	metrics *cons.Metrics
+
+	syncStartTime time.Time
 }
 
 // NewReactor returns new reactor instance.
@@ -109,6 +122,7 @@ func NewReactor(
 	blockchainCh *p2p.Channel,
 	peerUpdates *p2p.PeerUpdates,
 	fastSync bool,
+	metrics *cons.Metrics,
 ) (*Reactor, error) {
 	if state.LastBlockHeight != store.Height() {
 		return nil, fmt.Errorf("state (%v) and store (%v) height mismatch", state.LastBlockHeight, store.Height())
@@ -123,18 +137,20 @@ func NewReactor(
 	errorsCh := make(chan peerError, maxPeerErrBuffer) // NOTE: The capacity should be larger than the peer count.
 
 	r := &Reactor{
-		initialState:  state,
-		blockExec:     blockExec,
-		store:         store,
-		pool:          NewBlockPool(startHeight, requestsCh, errorsCh),
-		consReactor:   consReactor,
-		fastSync:      fastSync,
-		requestsCh:    requestsCh,
-		errorsCh:      errorsCh,
-		blockchainCh:  blockchainCh,
-		peerUpdates:   peerUpdates,
-		peerUpdatesCh: make(chan p2p.Envelope),
-		closeCh:       make(chan struct{}),
+		initialState:          state,
+		blockExec:             blockExec,
+		store:                 store,
+		pool:                  NewBlockPool(startHeight, requestsCh, errorsCh),
+		consReactor:           consReactor,
+		fastSync:              tmSync.NewBool(fastSync),
+		requestsCh:            requestsCh,
+		errorsCh:              errorsCh,
+		blockchainCh:          blockchainCh,
+		blockchainOutBridgeCh: make(chan p2p.Envelope),
+		peerUpdates:           peerUpdates,
+		closeCh:               make(chan struct{}),
+		metrics:               metrics,
+		syncStartTime:         time.Time{},
 	}
 
 	r.BaseService = *service.NewBaseService(logger, "Blockchain", r)
@@ -149,7 +165,7 @@ func NewReactor(
 // If fastSync is enabled, we also start the pool and the pool processing
 // goroutine. If the pool fails to start, an error is returned.
 func (r *Reactor) OnStart() error {
-	if r.fastSync {
+	if r.fastSync.IsSet() {
 		if err := r.pool.Start(); err != nil {
 			return err
 		}
@@ -167,7 +183,7 @@ func (r *Reactor) OnStart() error {
 // OnStop stops the reactor by signaling to all spawned goroutines to exit and
 // blocking until they all exit.
 func (r *Reactor) OnStop() {
-	if r.fastSync {
+	if r.fastSync.IsSet() {
 		if err := r.pool.Stop(); err != nil {
 			r.Logger.Error("failed to stop pool", "err", err)
 		}
@@ -189,7 +205,7 @@ func (r *Reactor) OnStop() {
 
 // respondToPeer loads a block and sends it to the requesting peer, if we have it.
 // Otherwise, we'll respond saying we do not have it.
-func (r *Reactor) respondToPeer(msg *bcproto.BlockRequest, peerID p2p.NodeID) {
+func (r *Reactor) respondToPeer(msg *bcproto.BlockRequest, peerID types.NodeID) {
 	block := r.store.LoadBlock(msg.Height)
 	if block != nil {
 		blockProto, err := block.ToProto()
@@ -261,7 +277,11 @@ func (r *Reactor) handleMessage(chID p2p.ChannelID, envelope p2p.Envelope) (err 
 	defer func() {
 		if e := recover(); e != nil {
 			err = fmt.Errorf("panic in processing message: %v", e)
-			r.Logger.Error("recovering from processing message panic", "err", err)
+			r.Logger.Error(
+				"recovering from processing message panic",
+				"err", err,
+				"stack", string(debug.Stack()),
+			)
 		}
 	}()
 
@@ -279,7 +299,7 @@ func (r *Reactor) handleMessage(chID p2p.ChannelID, envelope p2p.Envelope) (err 
 }
 
 // processBlockchainCh initiates a blocking process where we listen for and handle
-// envelopes on the BlockchainChannel and peerUpdatesCh. Any error encountered during
+// envelopes on the BlockchainChannel and blockchainOutBridgeCh. Any error encountered during
 // message execution will result in a PeerError being sent on the BlockchainChannel.
 // When the reactor is stopped, we will catch the signal and close the p2p Channel
 // gracefully.
@@ -297,8 +317,8 @@ func (r *Reactor) processBlockchainCh() {
 				}
 			}
 
-		case envelop := <-r.peerUpdatesCh:
-			r.blockchainCh.Out <- envelop
+		case envelope := <-r.blockchainOutBridgeCh:
+			r.blockchainCh.Out <- envelope
 
 		case <-r.closeCh:
 			r.Logger.Debug("stopped listening on blockchain channel; closing...")
@@ -320,7 +340,7 @@ func (r *Reactor) processPeerUpdate(peerUpdate p2p.PeerUpdate) {
 	switch peerUpdate.Status {
 	case p2p.PeerStatusUp:
 		// send a status update the newly added peer
-		r.peerUpdatesCh <- p2p.Envelope{
+		r.blockchainOutBridgeCh <- p2p.Envelope{
 			To: peerUpdate.NodeID,
 			Message: &bcproto.StatusResponse{
 				Base:   r.store.Base(),
@@ -354,13 +374,15 @@ func (r *Reactor) processPeerUpdates() {
 // SwitchToFastSync is called by the state sync reactor when switching to fast
 // sync.
 func (r *Reactor) SwitchToFastSync(state sm.State) error {
-	r.fastSync = true
+	r.fastSync.Set()
 	r.initialState = state
 	r.pool.height = state.LastBlockHeight + 1
 
 	if err := r.pool.Start(); err != nil {
 		return err
 	}
+
+	r.syncStartTime = time.Now()
 
 	r.poolWG.Add(1)
 	go r.poolRoutine(true)
@@ -384,7 +406,7 @@ func (r *Reactor) requestRoutine() {
 			return
 
 		case request := <-r.requestsCh:
-			r.blockchainCh.Out <- p2p.Envelope{
+			r.blockchainOutBridgeCh <- p2p.Envelope{
 				To:      request.PeerID,
 				Message: &bcproto.BlockRequest{Height: request.Height},
 			}
@@ -401,7 +423,7 @@ func (r *Reactor) requestRoutine() {
 			go func() {
 				defer r.poolWG.Done()
 
-				r.blockchainCh.Out <- p2p.Envelope{
+				r.blockchainOutBridgeCh <- p2p.Envelope{
 					Broadcast: true,
 					Message:   &bcproto.StatusRequest{},
 				}
@@ -473,6 +495,8 @@ FOR_LOOP:
 			if err := r.pool.Stop(); err != nil {
 				r.Logger.Error("failed to stop pool", "err", err)
 			}
+
+			r.fastSync.UnSet()
 
 			if r.consReactor != nil {
 				r.consReactor.SwitchToConsensus(state, blocksSynced > 0 || stateSynced)
@@ -560,6 +584,8 @@ FOR_LOOP:
 					panic(fmt.Sprintf("failed to process committed block (%d:%X): %v", first.Height, first.Hash(), err))
 				}
 
+				r.metrics.RecordConsMetrics(first)
+
 				blocksSynced++
 
 				if blocksSynced%100 == 0 {
@@ -581,4 +607,32 @@ FOR_LOOP:
 			break FOR_LOOP
 		}
 	}
+}
+
+func (r *Reactor) GetMaxPeerBlockHeight() int64 {
+	return r.pool.MaxPeerHeight()
+}
+
+func (r *Reactor) GetTotalSyncedTime() time.Duration {
+	if !r.fastSync.IsSet() || r.syncStartTime.IsZero() {
+		return time.Duration(0)
+	}
+	return time.Since(r.syncStartTime)
+}
+
+func (r *Reactor) GetRemainingSyncTime() time.Duration {
+	if !r.fastSync.IsSet() {
+		return time.Duration(0)
+	}
+
+	targetSyncs := r.pool.targetSyncBlocks()
+	currentSyncs := r.store.Height() - r.pool.startHeight + 1
+	lastSyncRate := r.pool.getLastSyncRate()
+	if currentSyncs < 0 || lastSyncRate < 0.001 {
+		return time.Duration(0)
+	}
+
+	remain := float64(targetSyncs-currentSyncs) / lastSyncRate
+
+	return time.Duration(int64(remain * float64(time.Second)))
 }

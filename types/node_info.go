@@ -1,4 +1,4 @@
-package p2p
+package types
 
 import (
 	"errors"
@@ -7,7 +7,6 @@ import (
 	"github.com/tendermint/tendermint/libs/bytes"
 	tmstrings "github.com/tendermint/tendermint/libs/strings"
 	tmp2p "github.com/tendermint/tendermint/proto/tendermint/p2p"
-	"github.com/tendermint/tendermint/version"
 )
 
 const (
@@ -27,23 +26,6 @@ type ProtocolVersion struct {
 	App   uint64 `json:"app"`
 }
 
-// defaultProtocolVersion populates the Block and P2P versions using
-// the global values, but not the App.
-var defaultProtocolVersion = NewProtocolVersion(
-	version.P2PProtocol,
-	version.BlockProtocol,
-	0,
-)
-
-// NewProtocolVersion returns a fully populated ProtocolVersion.
-func NewProtocolVersion(p2p, block, app uint64) ProtocolVersion {
-	return ProtocolVersion{
-		P2P:   p2p,
-		Block: block,
-		App:   app,
-	}
-}
-
 //-------------------------------------------------------------
 
 // NodeInfo is the basic node information exchanged
@@ -57,8 +39,9 @@ type NodeInfo struct {
 
 	// Check compatibility.
 	// Channels are HexBytes so easier to read as JSON
-	Network  string         `json:"network"`  // network/chain ID
-	Version  string         `json:"version"`  // major.minor.revision
+	Network string `json:"network"` // network/chain ID
+	Version string `json:"version"` // major.minor.revision
+	// FIXME: This should be changed to uint16 to be consistent with the updated channel type
 	Channels bytes.HexBytes `json:"channels"` // channels this node knows about
 
 	// ASCIIText fields
@@ -95,7 +78,7 @@ func (info NodeInfo) Validate() error {
 	// ID is already validated.
 
 	// Validate ListenAddr.
-	_, err := NewNetAddressString(IDAddressString(info.ID(), info.ListenAddr))
+	_, err := NewNetAddressString(info.ID().AddressString(info.ListenAddr))
 	if err != nil {
 		return err
 	}
@@ -185,8 +168,33 @@ OUTER_LOOP:
 // ListenAddr. Note that the ListenAddr is not authenticated and
 // may not match that address actually dialed if its an outbound peer.
 func (info NodeInfo) NetAddress() (*NetAddress, error) {
-	idAddr := IDAddressString(info.ID(), info.ListenAddr)
+	idAddr := info.ID().AddressString(info.ListenAddr)
 	return NewNetAddressString(idAddr)
+}
+
+// AddChannel is used by the router when a channel is opened to add it to the node info
+func (info *NodeInfo) AddChannel(channel uint16) {
+	// check that the channel doesn't already exist
+	for _, ch := range info.Channels {
+		if ch == byte(channel) {
+			return
+		}
+	}
+
+	info.Channels = append(info.Channels, byte(channel))
+}
+
+func (info NodeInfo) Copy() NodeInfo {
+	return NodeInfo{
+		ProtocolVersion: info.ProtocolVersion,
+		NodeID:          info.NodeID,
+		ListenAddr:      info.ListenAddr,
+		Network:         info.Network,
+		Version:         info.Version,
+		Channels:        info.Channels,
+		Moniker:         info.Moniker,
+		Other:           info.Other,
+	}
 }
 
 func (info NodeInfo) ToProto() *tmp2p.NodeInfo {

@@ -39,13 +39,13 @@ var (
 
 type reactorTestSuite struct {
 	network             *p2ptest.Network
-	states              map[p2p.NodeID]*State
-	reactors            map[p2p.NodeID]*Reactor
-	subs                map[p2p.NodeID]types.Subscription
-	stateChannels       map[p2p.NodeID]*p2p.Channel
-	dataChannels        map[p2p.NodeID]*p2p.Channel
-	voteChannels        map[p2p.NodeID]*p2p.Channel
-	voteSetBitsChannels map[p2p.NodeID]*p2p.Channel
+	states              map[types.NodeID]*State
+	reactors            map[types.NodeID]*Reactor
+	subs                map[types.NodeID]types.Subscription
+	stateChannels       map[types.NodeID]*p2p.Channel
+	dataChannels        map[types.NodeID]*p2p.Channel
+	voteChannels        map[types.NodeID]*p2p.Channel
+	voteSetBitsChannels map[types.NodeID]*p2p.Channel
 }
 
 func chDesc(chID p2p.ChannelID) p2p.ChannelDescriptor {
@@ -59,9 +59,9 @@ func setup(t *testing.T, numNodes int, states []*State, size int) *reactorTestSu
 
 	rts := &reactorTestSuite{
 		network:  p2ptest.MakeNetwork(t, p2ptest.NetworkOptions{NumNodes: numNodes}),
-		states:   make(map[p2p.NodeID]*State),
-		reactors: make(map[p2p.NodeID]*Reactor, numNodes),
-		subs:     make(map[p2p.NodeID]types.Subscription, numNodes),
+		states:   make(map[types.NodeID]*State),
+		reactors: make(map[types.NodeID]*Reactor, numNodes),
+		subs:     make(map[types.NodeID]types.Subscription, numNodes),
 	}
 
 	rts.stateChannels = rts.network.MakeChannelsNoCleanup(t, chDesc(StateChannel), new(tmcons.Message), size)
@@ -257,7 +257,9 @@ func TestReactorBasic(t *testing.T) {
 	config := configSetup(t)
 
 	n := 4
-	states, cleanup := randConsensusState(t, config, n, "consensus_reactor_test", newMockTickerFunc(true), newCounter)
+	states, cleanup := randConsensusState(t,
+		config, n, "consensus_reactor_test",
+		newMockTickerFunc(true), newKVStore)
 	t.Cleanup(cleanup)
 
 	rts := setup(t, n, states, 100) // buffer must be large enough to not deadlock
@@ -287,7 +289,7 @@ func TestReactorWithEvidence(t *testing.T) {
 	n := 4
 	testName := "consensus_reactor_test"
 	tickerFunc := newMockTickerFunc(true)
-	appFunc := newCounter
+	appFunc := newKVStore
 
 	genDoc, privVals := factory.RandGenesisDoc(config, n, false, 30)
 	states := make([]*State, n)
@@ -387,7 +389,7 @@ func TestReactorCreatesBlockWhenEmptyBlocksFalse(t *testing.T) {
 		n,
 		"consensus_reactor_test",
 		newMockTickerFunc(true),
-		newCounter,
+		newKVStore,
 		func(c *cfg.Config) {
 			c.Consensus.CreateEmptyBlocks = false
 		},
@@ -431,7 +433,9 @@ func TestReactorRecordsVotesAndBlockParts(t *testing.T) {
 	config := configSetup(t)
 
 	n := 4
-	states, cleanup := randConsensusState(t, config, n, "consensus_reactor_test", newMockTickerFunc(true), newCounter)
+	states, cleanup := randConsensusState(t,
+		config, n, "consensus_reactor_test",
+		newMockTickerFunc(true), newKVStore)
 	t.Cleanup(cleanup)
 
 	rts := setup(t, n, states, 100) // buffer must be large enough to not deadlock
