@@ -3,10 +3,9 @@ package consensus
 import (
 	"github.com/go-kit/kit/metrics"
 	"github.com/go-kit/kit/metrics/discard"
-	"github.com/tendermint/tendermint/types"
-
 	prometheus "github.com/go-kit/kit/metrics/prometheus"
 	stdprometheus "github.com/prometheus/client_golang/prometheus"
+	"github.com/tendermint/tendermint/types"
 )
 
 const (
@@ -61,6 +60,9 @@ type Metrics struct {
 
 	// Number of blockparts transmitted by peer.
 	BlockParts metrics.Counter
+
+	// The latency of current block commitment.
+	CurLatency metrics.Histogram
 }
 
 // PrometheusMetrics returns Metrics build using Prometheus client library.
@@ -187,6 +189,12 @@ func PrometheusMetrics(namespace string, labelsAndValues ...string) *Metrics {
 			Name:      "block_parts",
 			Help:      "Number of blockparts transmitted by peer.",
 		}, append(labels, "peer_id")).With(labelsAndValues...),
+		CurLatency: prometheus.NewHistogramFrom(stdprometheus.HistogramOpts{
+			Namespace: namespace,
+			Subsystem: MetricsSubsystem,
+			Name:      "latency",
+			Help:      "Latency of one block commitment.",
+		}, labels).With(labelsAndValues...),
 	}
 }
 
@@ -217,6 +225,8 @@ func NopMetrics() *Metrics {
 		BlockSyncing:    discard.NewGauge(),
 		StateSyncing:    discard.NewGauge(),
 		BlockParts:      discard.NewCounter(),
+
+		CurLatency: discard.NewHistogram(),
 	}
 }
 
