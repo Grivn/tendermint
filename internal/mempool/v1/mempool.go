@@ -386,6 +386,9 @@ func (txmp *TxMempool) ReapMaxBytesMaxGas(maxBytes, maxGas int64) types.Txs {
 		}
 
 		totalGas = gas
+
+		// calculate the wrapped latency of transactions.
+		txmp.metrics.WrappedLatency.Set(time.Now().Sub(wtx.timestamp).Seconds())
 	}
 
 	return txs

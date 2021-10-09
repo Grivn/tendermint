@@ -62,7 +62,7 @@ type Metrics struct {
 	BlockParts metrics.Counter
 
 	// The latency of current block commitment.
-	CurLatency metrics.Histogram
+	CurLatency metrics.Gauge
 }
 
 // PrometheusMetrics returns Metrics build using Prometheus client library.
@@ -189,7 +189,7 @@ func PrometheusMetrics(namespace string, labelsAndValues ...string) *Metrics {
 			Name:      "block_parts",
 			Help:      "Number of blockparts transmitted by peer.",
 		}, append(labels, "peer_id")).With(labelsAndValues...),
-		CurLatency: prometheus.NewHistogramFrom(stdprometheus.HistogramOpts{
+		CurLatency: prometheus.NewGaugeFrom(stdprometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: MetricsSubsystem,
 			Name:      "latency",
@@ -226,7 +226,7 @@ func NopMetrics() *Metrics {
 		StateSyncing:    discard.NewGauge(),
 		BlockParts:      discard.NewCounter(),
 
-		CurLatency: discard.NewHistogram(),
+		CurLatency: discard.NewGauge(),
 	}
 }
 

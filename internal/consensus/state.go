@@ -1814,7 +1814,7 @@ func (cs *State) RecordMetrics(height int64, block *types.Block) {
 		}
 	}
 
-	cs.metrics.CurLatency.Observe(time.Now().Sub(block.Time).Seconds())
+	cs.metrics.CurLatency.Set(time.Now().Sub(block.Time).Seconds())
 	cs.metrics.NumTxs.Set(float64(len(block.Data.Txs)))
 	cs.metrics.TotalTxs.Add(float64(len(block.Data.Txs)))
 	cs.metrics.BlockSizeBytes.Observe(float64(block.Size()))
